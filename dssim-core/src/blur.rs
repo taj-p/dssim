@@ -493,3 +493,74 @@ fn blur_two() {
 // sweep.
 #[cfg(test)]
 mod equiv_tests;
+
+// Microbenchmarks for the blur hot paths. Kept inside the crate because the
+// `blur` module is private. Run with:
+//   RUSTC_BOOTSTRAP=1 cargo bench -p dssim-core
+// (matches the repo's existing nightly-`test` bench convention.)
+#[cfg(test)]
+mod blur_bench {
+    extern crate test;
+    use super::{blur, blur_in_place, blur_mul};
+    use imgref::*;
+    use std::mem::MaybeUninit;
+    use test::Bencher;
+
+    // Deterministic pseudo-random fill so the benched data is representative
+    // (autovectorizable but not degenerate) without a `rand` dependency.
+    fn make_image(w: usize, h: usize, seed: u32) -> ImgVec<f32> {
+        let mut s = seed | 1;
+        let buf: Vec<f32> = (0..w * h)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                (s >> 8) as f32 / (1u32 << 24) as f32
+            })
+            .collect();
+        ImgVec::new(buf, w, h)
+    }
+
+    fn bench_blur(b: &mut Bencher, w: usize, h: usize) {
+        let src = make_image(w, h, 0x1234_5678);
+        let mut tmp: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); w * h];
+        b.iter(|| test::black_box(blur(test::black_box(src.as_ref()), &mut tmp)));
+    }
+
+    fn bench_blur_in_place(b: &mut Bencher, w: usize, h: usize) {
+        // Blur the same buffer in place repeatedly: this measures pure blur
+        // cost (no per-iteration clone). Re-blurring a blurred image is
+        // same-shape, finite work, so the timing is representative.
+        let mut img = make_image(w, h, 0x1234_5678);
+        let mut tmp: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); w * h];
+        b.iter(|| {
+            blur_in_place(test::black_box(img.as_mut()), &mut tmp);
+            test::black_box(&img);
+        });
+    }
+
+    fn bench_blur_mul(b: &mut Bencher, w: usize, h: usize) {
+        let a = make_image(w, h, 0x1234_5678);
+        let c = make_image(w, h, 0x9E37_79B9);
+        let mut tmp: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); w * h];
+        b.iter(|| {
+            test::black_box(blur_mul(
+                test::black_box(a.as_ref()),
+                test::black_box(c.as_ref()),
+                &mut tmp,
+            ))
+        });
+    }
+
+    #[bench] fn blur_320x200(b: &mut Bencher) { bench_blur(b, 320, 200); }
+    #[bench] fn blur_1024x768(b: &mut Bencher) { bench_blur(b, 1024, 768); }
+    #[bench] fn blur_1920x1080(b: &mut Bencher) { bench_blur(b, 1920, 1080); }
+
+    #[bench] fn blur_in_place_320x200(b: &mut Bencher) { bench_blur_in_place(b, 320, 200); }
+    #[bench] fn blur_in_place_1024x768(b: &mut Bencher) { bench_blur_in_place(b, 1024, 768); }
+    #[bench] fn blur_in_place_1920x1080(b: &mut Bencher) { bench_blur_in_place(b, 1920, 1080); }
+
+    #[bench] fn blur_mul_320x200(b: &mut Bencher) { bench_blur_mul(b, 320, 200); }
+    #[bench] fn blur_mul_1024x768(b: &mut Bencher) { bench_blur_mul(b, 1024, 768); }
+    #[bench] fn blur_mul_1920x1080(b: &mut Bencher) { bench_blur_mul(b, 1920, 1080); }
+}
