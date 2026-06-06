@@ -267,9 +267,13 @@ impl Dssim {
     #[inline(never)]
     fn compare_inner(&self, original_image: &DssimImage<f32>, modified_image: &DssimImage<f32>) -> (Val, Vec<SsimMap>) {
         let scaled_images_iter = modified_image.scale.iter().zip(original_image.scale.iter());
-        let combined_iter = self.scale_weights.iter().copied().zip(scaled_images_iter).enumerate();
+        // Materialize the per-scale work items, then drive them with an
+        // indexed parallel iterator. This avoids par_bridge's mutex-based
+        // sequential-to-parallel bridge and keeps `res` in scale order, which
+        // makes the subsequent floating-point weighted sum deterministic.
+        let combined: Vec<_> = self.scale_weights.iter().copied().zip(scaled_images_iter).enumerate().collect();
 
-        let res: Vec<_> = combined_iter.par_bridge().map(|(n, (weight, (modified_image_scale, original_image_scale)))| {
+        let res: Vec<_> = combined.into_par_iter().map(|(n, (weight, (modified_image_scale, original_image_scale)))| {
             let scale_width = original_image_scale.chan[0].width;
             let scale_height = original_image_scale.chan[0].height;
             let pixels = scale_width * scale_height;
