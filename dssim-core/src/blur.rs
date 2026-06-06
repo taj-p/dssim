@@ -33,6 +33,114 @@ mod portable {
     use imgref::*;
     use std::mem::MaybeUninit;
 
+    /// True when the CPU supports the AVX2+FMA hot path. `is_x86_feature_detected!`
+    /// caches its result internally, so after the first call this is just an
+    /// atomic load + branch.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn has_avx2_fma() -> bool {
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+    }
+
+    /// Plain 5-tap elementwise combine over six equal-length slices:
+    /// `out[i] = (m2+p2)·OUTER + (m1+p1)·INNER + c·MID`.
+    /// Shared interior body of both `blur_h5` (offset sub-slices) and
+    /// `blur_v5` (full-width rows). Re-slicing to `out.len()` lets LLVM hoist
+    /// the bounds checks and vectorize the loop.
+    #[inline(always)]
+    fn blur5_inner(
+        m2: &[f32], m1: &[f32], c: &[f32], p1: &[f32], p2: &[f32],
+        out: &mut [MaybeUninit<f32>],
+    ) {
+        let n = out.len();
+        let (m2, m1, c, p1, p2) = (&m2[..n], &m1[..n], &c[..n], &p1[..n], &p2[..n]);
+        for i in 0..n {
+            out[i].write((m2[i] + p2[i]) * K5_OUTER + (m1[i] + p1[i]) * K5_INNER + c[i] * K5_MID);
+        }
+    }
+
+    /// AVX2/FMA build of `blur5_inner`. Because `blur5_inner` is
+    /// `#[inline(always)]`, LLVM re-codegens it here with 256-bit (8×f32)
+    /// vectors instead of the baseline SSE2 (4×f32). The arithmetic is
+    /// elementwise (no reduction), so results are bit-identical to the
+    /// portable path; we do not enable fast-math.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn blur5_inner_avx2(
+        m2: &[f32], m1: &[f32], c: &[f32], p1: &[f32], p2: &[f32],
+        out: &mut [MaybeUninit<f32>],
+    ) {
+        blur5_inner(m2, m1, c, p1, p2, out);
+    }
+
+    /// Runtime-dispatched `blur5_inner`.
+    #[inline]
+    fn blur5(
+        m2: &[f32], m1: &[f32], c: &[f32], p1: &[f32], p2: &[f32],
+        out: &mut [MaybeUninit<f32>],
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        if has_avx2_fma() {
+            // SAFETY: only reached after confirming AVX2+FMA are present.
+            unsafe { blur5_inner_avx2(m2, m1, c, p1, p2, out) };
+            return;
+        }
+        blur5_inner(m2, m1, c, p1, p2, out);
+    }
+
+    /// 5-tap elementwise combine fused with a per-pixel product
+    /// (`q[i] = a[i]·b[i]`), then the same 5-tap form over `q`. Shared interior
+    /// body of `blur_h5_mul`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn blur5_inner_mul(
+        a_m2: &[f32], a_m1: &[f32], a_c: &[f32], a_p1: &[f32], a_p2: &[f32],
+        b_m2: &[f32], b_m1: &[f32], b_c: &[f32], b_p1: &[f32], b_p2: &[f32],
+        out: &mut [MaybeUninit<f32>],
+    ) {
+        let n = out.len();
+        let (a_m2, a_m1, a_c, a_p1, a_p2) = (&a_m2[..n], &a_m1[..n], &a_c[..n], &a_p1[..n], &a_p2[..n]);
+        let (b_m2, b_m1, b_c, b_p1, b_p2) = (&b_m2[..n], &b_m1[..n], &b_c[..n], &b_p1[..n], &b_p2[..n]);
+        for i in 0..n {
+            let pm2 = a_m2[i] * b_m2[i];
+            let pm1 = a_m1[i] * b_m1[i];
+            let pc = a_c[i] * b_c[i];
+            let pp1 = a_p1[i] * b_p1[i];
+            let pp2 = a_p2[i] * b_p2[i];
+            out[i].write((pm2 + pp2) * K5_OUTER + (pm1 + pp1) * K5_INNER + pc * K5_MID);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn blur5_inner_mul_avx2(
+        a_m2: &[f32], a_m1: &[f32], a_c: &[f32], a_p1: &[f32], a_p2: &[f32],
+        b_m2: &[f32], b_m1: &[f32], b_c: &[f32], b_p1: &[f32], b_p2: &[f32],
+        out: &mut [MaybeUninit<f32>],
+    ) {
+        blur5_inner_mul(a_m2, a_m1, a_c, a_p1, a_p2, b_m2, b_m1, b_c, b_p1, b_p2, out);
+    }
+
+    /// Runtime-dispatched `blur5_inner_mul`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn blur5_mul(
+        a_m2: &[f32], a_m1: &[f32], a_c: &[f32], a_p1: &[f32], a_p2: &[f32],
+        b_m2: &[f32], b_m1: &[f32], b_c: &[f32], b_p1: &[f32], b_p2: &[f32],
+        out: &mut [MaybeUninit<f32>],
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        if has_avx2_fma() {
+            // SAFETY: only reached after confirming AVX2+FMA are present.
+            unsafe {
+                blur5_inner_mul_avx2(a_m2, a_m1, a_c, a_p1, a_p2, b_m2, b_m1, b_c, b_p1, b_p2, out)
+            };
+            return;
+        }
+        blur5_inner_mul(a_m2, a_m1, a_c, a_p1, a_p2, b_m2, b_m1, b_c, b_p1, b_p2, out);
+    }
+
     /// Horizontal 5-tap blur, bit-equivalent to two sequential clamped 1D
     /// 3-tap blurs. Edges (`j=0` and `j=w-1`) use the legacy-equivalent
     /// 3-coefficient form derived from H1·H1 clamping; `j=1` and `j=w-2`
@@ -93,13 +201,7 @@ mod portable {
                 let r_p2 = &row[4..4 + inner_len];
                 let (_, out_rest) = out.split_at_mut(2);
                 let out_inner = &mut out_rest[..inner_len];
-                for j in 0..inner_len {
-                    out_inner[j].write(
-                        (r_m2[j] + r_p2[j]) * K5_OUTER
-                        + (r_m1[j] + r_p1[j]) * K5_INNER
-                        + r_c[j] * K5_MID,
-                    );
-                }
+                blur5(r_m2, r_m1, r_c, r_p1, r_p2, out_inner);
             }
         }
     }
@@ -184,13 +286,7 @@ mod portable {
                 let rp1 = row(y + 1);
                 let rp2 = row(y + 2);
                 let out = &mut dst[y * dst_stride..][..width];
-                for x in 0..width {
-                    out[x].write(
-                        (rm2[x] + rp2[x]) * K5_OUTER
-                        + (rm1[x] + rp1[x]) * K5_INNER
-                        + rc[x] * K5_MID,
-                    );
-                }
+                blur5(rm2, rm1, rc, rp1, rp2, out);
             }
         }
     }
@@ -266,14 +362,11 @@ mod portable {
                 let s2_p2 = &r2[4..4 + inner_len];
                 let (_, out_rest) = out.split_at_mut(2);
                 let out_inner = &mut out_rest[..inner_len];
-                for j in 0..inner_len {
-                    let pm2 = s1_m2[j] * s2_m2[j];
-                    let pm1 = s1_m1[j] * s2_m1[j];
-                    let pc  = s1_c[j]  * s2_c[j];
-                    let pp1 = s1_p1[j] * s2_p1[j];
-                    let pp2 = s1_p2[j] * s2_p2[j];
-                    out_inner[j].write((pm2 + pp2) * K5_OUTER + (pm1 + pp1) * K5_INNER + pc * K5_MID);
-                }
+                blur5_mul(
+                    s1_m2, s1_m1, s1_c, s1_p1, s1_p2,
+                    s2_m2, s2_m1, s2_c, s2_p1, s2_p2,
+                    out_inner,
+                );
             }
         }
     }
