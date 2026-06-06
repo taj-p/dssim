@@ -199,3 +199,67 @@ fn cbrts2() {
     println!("2={totaldiff:0.6}; {maxdiff:0.8}");
     assert!(totaldiff < 0.0025, "{totaldiff}");
 }
+
+// Microbenchmarks for the non-blur pipeline hot paths (gamma->linear,
+// RGB->LAB, downsample). Run with:
+//   RUSTC_BOOTSTRAP=1 cargo bench -p dssim-core
+#[cfg(test)]
+mod perf_bench {
+    extern crate test;
+    use crate::image::RGBAPLU;
+    use crate::linear::ToRGBAPLU;
+    use crate::tolab::ToLABBitmap;
+    use crate::image::Downsample;
+    use imgref::*;
+    use rgb::RGBA;
+    use test::Bencher;
+
+    fn xorshift(s: &mut u32) -> u32 {
+        *s ^= *s << 13;
+        *s ^= *s >> 17;
+        *s ^= *s << 5;
+        *s
+    }
+
+    fn rgba_u8(w: usize, h: usize) -> Vec<RGBA<u8>> {
+        let mut s = 0x1234_5678u32;
+        (0..w * h)
+            .map(|_| {
+                let v = xorshift(&mut s);
+                RGBA::new(v as u8, (v >> 8) as u8, (v >> 16) as u8, (v >> 24) as u8)
+            })
+            .collect()
+    }
+
+    fn rgbaplu_img(w: usize, h: usize) -> ImgVec<RGBAPLU> {
+        let buf = rgba_u8(w, h).to_rgbaplu();
+        ImgVec::new(buf, w, h)
+    }
+
+    fn bench_to_rgbaplu(b: &mut Bencher, w: usize, h: usize) {
+        let src = rgba_u8(w, h);
+        b.iter(|| test::black_box(test::black_box(&src[..]).to_rgbaplu()));
+    }
+
+    fn bench_to_lab(b: &mut Bencher, w: usize, h: usize) {
+        let img = rgbaplu_img(w, h);
+        b.iter(|| test::black_box(test::black_box(&img).to_lab()));
+    }
+
+    fn bench_downsample(b: &mut Bencher, w: usize, h: usize) {
+        let img = rgbaplu_img(w, h);
+        b.iter(|| test::black_box(test::black_box(&img).downsample()));
+    }
+
+    #[bench] fn to_rgbaplu_320x200(b: &mut Bencher) { bench_to_rgbaplu(b, 320, 200); }
+    #[bench] fn to_rgbaplu_1024x768(b: &mut Bencher) { bench_to_rgbaplu(b, 1024, 768); }
+    #[bench] fn to_rgbaplu_1920x1080(b: &mut Bencher) { bench_to_rgbaplu(b, 1920, 1080); }
+
+    #[bench] fn to_lab_320x200(b: &mut Bencher) { bench_to_lab(b, 320, 200); }
+    #[bench] fn to_lab_1024x768(b: &mut Bencher) { bench_to_lab(b, 1024, 768); }
+    #[bench] fn to_lab_1920x1080(b: &mut Bencher) { bench_to_lab(b, 1920, 1080); }
+
+    #[bench] fn downsample_320x200(b: &mut Bencher) { bench_downsample(b, 320, 200); }
+    #[bench] fn downsample_1024x768(b: &mut Bencher) { bench_downsample(b, 1024, 768); }
+    #[bench] fn downsample_1920x1080(b: &mut Bencher) { bench_downsample(b, 1920, 1080); }
+}
