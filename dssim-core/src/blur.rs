@@ -141,233 +141,248 @@ mod portable {
         blur5_inner_mul(a_m2, a_m1, a_c, a_p1, a_p2, b_m2, b_m1, b_c, b_p1, b_p2, out);
     }
 
-    /// Horizontal 5-tap blur, bit-equivalent to two sequential clamped 1D
-    /// 3-tap blurs. Edges (`j=0` and `j=w-1`) use the legacy-equivalent
-    /// 3-coefficient form derived from H1·H1 clamping; `j=1` and `j=w-2`
-    /// already match H1·H1 with the plain clamped 5-tap.
-    fn blur_h5(src: &[f32], dst: &mut [MaybeUninit<f32>], width: usize, height: usize, src_stride: usize) {
+    /// Horizontal 5-tap blur of a single row, bit-equivalent to two sequential
+    /// clamped 1D 3-tap blurs. Edges (`j=0` and `j=w-1`) use the
+    /// legacy-equivalent 3-coefficient form derived from H1·H1 clamping; `j=1`
+    /// and `j=w-2` already match H1·H1 with the plain clamped 5-tap. `row` and
+    /// `out` must both have length `width`.
+    fn blur_h5_row(row: &[f32], out: &mut [MaybeUninit<f32>], width: usize) {
         debug_assert!(width >= 1);
+        debug_assert_eq!(row.len(), width);
+        debug_assert_eq!(out.len(), width);
         let last = width - 1;
-        for y in 0..height {
-            let row = &src[y * src_stride..][..width];
-            let out = &mut dst[y * width..][..width];
 
-            // Edge: j=0. Reads p[0], p[min(1, last)], p[min(2, last)] with
-            // the H1·H1-derived weights. Works for any width ≥ 1.
-            let p0 = row[0];
-            let p1 = row[1.min(last)];
-            let p2 = row[2.min(last)];
-            out[0].write(K5_EDGE_CENTER * p0 + K5_EDGE_NEAR * p1 + K5_EDGE_FAR * p2);
+        // Edge: j=0. Reads p[0], p[min(1, last)], p[min(2, last)] with
+        // the H1·H1-derived weights. Works for any width ≥ 1.
+        let p0 = row[0];
+        let p1 = row[1.min(last)];
+        let p2 = row[2.min(last)];
+        out[0].write(K5_EDGE_CENTER * p0 + K5_EDGE_NEAR * p1 + K5_EDGE_FAR * p2);
 
-            // Edge: j=w-1 (mirror of j=0). Skipped when width==1 because
-            // j=0 already covered it.
-            if width >= 2 {
-                let pl = row[last];
-                let pl1 = row[last - 1];
-                let pl2 = row[last.saturating_sub(2)];
-                out[last].write(K5_EDGE_FAR * pl2 + K5_EDGE_NEAR * pl1 + K5_EDGE_CENTER * pl);
-            }
+        // Edge: j=w-1 (mirror of j=0). Skipped when width==1 because
+        // j=0 already covered it.
+        if width >= 2 {
+            let pl = row[last];
+            let pl1 = row[last - 1];
+            let pl2 = row[last.saturating_sub(2)];
+            out[last].write(K5_EDGE_FAR * pl2 + K5_EDGE_NEAR * pl1 + K5_EDGE_CENTER * pl);
+        }
 
-            // Near-edge: j=1 — plain clamped 5-tap (matches H1·H1).
-            if width >= 3 {
-                // i-2 → 0, i-1 → 0, i = 1, i+1 = 2, i+2 = min(3, last)
-                let m2 = row[0];
-                let m1 = row[0];
-                let c = row[1];
-                let p1n = row[2.min(last)];
-                let p2n = row[3.min(last)];
-                out[1].write((m2 + p2n) * K5_OUTER + (m1 + p1n) * K5_INNER + c * K5_MID);
-            }
+        // Near-edge: j=1 — plain clamped 5-tap (matches H1·H1).
+        if width >= 3 {
+            // i-2 → 0, i-1 → 0, i = 1, i+1 = 2, i+2 = min(3, last)
+            let m2 = row[0];
+            let m1 = row[0];
+            let c = row[1];
+            let p1n = row[2.min(last)];
+            let p2n = row[3.min(last)];
+            out[1].write((m2 + p2n) * K5_OUTER + (m1 + p1n) * K5_INNER + c * K5_MID);
+        }
 
-            // Near-edge: j=w-2 — plain clamped 5-tap (matches H1·H1).
-            if width >= 4 {
-                let i = last - 1;
-                let m2 = row[i - 2];
-                let m1 = row[i - 1];
-                let c = row[i];
-                let p1n = row[i + 1];           // = last
-                let p2n = row[(i + 2).min(last)]; // i+2 == last+1 → clamp to last
-                out[i].write((m2 + p2n) * K5_OUTER + (m1 + p1n) * K5_INNER + c * K5_MID);
-            }
+        // Near-edge: j=w-2 — plain clamped 5-tap (matches H1·H1).
+        if width >= 4 {
+            let i = last - 1;
+            let m2 = row[i - 2];
+            let m1 = row[i - 1];
+            let c = row[i];
+            let p1n = row[i + 1];           // = last
+            let p2n = row[(i + 2).min(last)]; // i+2 == last+1 → clamp to last
+            out[i].write((m2 + p2n) * K5_OUTER + (m1 + p1n) * K5_INNER + c * K5_MID);
+        }
 
-            // Interior: j ∈ [2, w-2). Five aligned sub-slices so LLVM hoists
-            // bounds checks once per row and emits AVX2/NEON SIMD over the body.
-            if width >= 5 {
-                let inner_len = width - 4;
-                let r_m2 = &row[..inner_len];
-                let r_m1 = &row[1..1 + inner_len];
-                let r_c  = &row[2..2 + inner_len];
-                let r_p1 = &row[3..3 + inner_len];
-                let r_p2 = &row[4..4 + inner_len];
-                let (_, out_rest) = out.split_at_mut(2);
-                let out_inner = &mut out_rest[..inner_len];
-                blur5(r_m2, r_m1, r_c, r_p1, r_p2, out_inner);
-            }
+        // Interior: j ∈ [2, w-2). Five aligned sub-slices so LLVM hoists
+        // bounds checks once per row and emits AVX2/NEON SIMD over the body.
+        if width >= 5 {
+            let inner_len = width - 4;
+            let r_m2 = &row[..inner_len];
+            let r_m1 = &row[1..1 + inner_len];
+            let r_c  = &row[2..2 + inner_len];
+            let r_p1 = &row[3..3 + inner_len];
+            let r_p2 = &row[4..4 + inner_len];
+            let (_, out_rest) = out.split_at_mut(2);
+            let out_inner = &mut out_rest[..inner_len];
+            blur5(r_m2, r_m1, r_c, r_p1, r_p2, out_inner);
         }
     }
 
-    /// Vertical 5-tap blur, bit-equivalent to two sequential clamped 1D
-    /// 3-tap blurs. Same edge-handling structure as `blur_h5`. `src` must
-    /// be tightly packed (stride == width).
-    fn blur_v5(src: &[f32], dst: &mut [MaybeUninit<f32>], width: usize, height: usize, dst_stride: usize) {
-        debug_assert!(height >= 1);
+    /// Borrow H-blurred row `i` from the 5-row ring buffer as `&[f32]`.
+    /// SAFETY: row `i` must have been fully written by the producer (it always
+    /// is before any read in `blur_fused`).
+    #[inline(always)]
+    fn ring_row(ring: &[MaybeUninit<f32>], width: usize, i: usize) -> &[f32] {
+        // SAFETY: caller guarantees row `i`'s slot is fully initialized.
+        unsafe { assume_init_ref(&ring[(i % 5) * width..][..width]) }
+    }
+
+    /// Single-pass separable 5-tap blur. Rather than materialize the whole
+    /// H-blurred image and sweep it again for the vertical pass, this keeps only
+    /// the last five H-blurred rows in a small ring buffer and emits each
+    /// vertical output row as soon as its 5-row input window is available. This
+    /// removes a full `width*height` write+read of the intermediate.
+    ///
+    /// `produce_h_row(i, slot)` must H-blur source row `i` into `slot` (length
+    /// `width`). The vertical combine reproduces the previous two-pass `blur_v5`
+    /// branch-for-branch — same rows, same order, same edge coefficients — so
+    /// the output is bit-identical.
+    ///
+    /// SAFETY: `dst_ptr` must be valid for writing `width` cells at every offset
+    /// `y * dst_stride` (`y in 0..height`). The in-place caller may have
+    /// `produce_h_row` read from the same allocation as `dst_ptr`, which is
+    /// sound here because (a) the producer is always at least as far ahead as
+    /// the row being emitted, so every source row is read before it is written,
+    /// and (b) reads and writes touch disjoint per-row sub-ranges via the same
+    /// base provenance.
+    unsafe fn blur_fused(
+        width: usize,
+        height: usize,
+        dst_ptr: *mut MaybeUninit<f32>,
+        dst_stride: usize,
+        tmp: &mut [MaybeUninit<f32>],
+        mut produce_h_row: impl FnMut(usize, &mut [MaybeUninit<f32>]),
+    ) {
+        debug_assert!(width >= 1 && height >= 1);
         let last_y = height - 1;
 
-        // Helper: row slice at index y (clamped within [0, last_y]).
-        let row = |y: usize| &src[y * width..][..width];
+        // 5-row ring of H-blurred rows. Reuse the caller's `tmp` when big enough
+        // (the common case, height >= 5); otherwise allocate a tiny scratch.
+        let ring_len = 5 * width;
+        let mut ring_owned: Vec<MaybeUninit<f32>>;
+        let ring: &mut [MaybeUninit<f32>] = if tmp.len() >= ring_len {
+            &mut tmp[..ring_len]
+        } else {
+            ring_owned = (0..ring_len).map(|_| MaybeUninit::uninit()).collect();
+            &mut ring_owned
+        };
 
-        // Edge: y=0 — H1·H1-derived 3-coefficient form (vertical).
-        {
-            let r0 = row(0);
-            let r1 = row(1.min(last_y));
-            let r2 = row(2.min(last_y));
-            let out = &mut dst[..width];
-            for x in 0..width {
-                out[x].write(
-                    K5_EDGE_CENTER * r0[x] + K5_EDGE_NEAR * r1[x] + K5_EDGE_FAR * r2[x],
-                );
+        let mut produced = 0usize; // rows [0, produced) are present in the ring
+
+        for y in 0..height {
+            // Every vertical branch references at most input row y+2 (clamped),
+            // so make sure rows up to that index are produced.
+            let needed = (y + 2).min(last_y);
+            while produced <= needed {
+                let slot = produced % 5;
+                produce_h_row(produced, &mut ring[slot * width..][..width]);
+                produced += 1;
             }
-        }
 
-        // Edge: y=h-1 (mirror of y=0).
-        if height >= 2 {
-            let rl = row(last_y);
-            let rl1 = row(last_y - 1);
-            let rl2 = row(last_y.saturating_sub(2));
-            let out = &mut dst[last_y * dst_stride..][..width];
-            for x in 0..width {
-                out[x].write(
-                    K5_EDGE_FAR * rl2[x] + K5_EDGE_NEAR * rl1[x] + K5_EDGE_CENTER * rl[x],
-                );
-            }
-        }
+            // SAFETY: row `y` is in-bounds and disjoint from any concurrently
+            // live borrow (see fn-level safety note).
+            let out = unsafe { std::slice::from_raw_parts_mut(dst_ptr.add(y * dst_stride), width) };
 
-        // Near-edge: y=1 — plain clamped 5-tap.
-        if height >= 3 {
-            let rm = row(0);
-            let rc = row(1);
-            let rp1 = row(2.min(last_y));
-            let rp2 = row(3.min(last_y));
-            let out = &mut dst[dst_stride..][..width];
-            for x in 0..width {
-                // m2 and m1 both clamp to row 0.
-                out[x].write(
-                    (rm[x] + rp2[x]) * K5_OUTER
-                    + (rm[x] + rp1[x]) * K5_INNER
-                    + rc[x] * K5_MID,
-                );
-            }
-        }
-
-        // Near-edge: y=h-2 — plain clamped 5-tap.
-        if height >= 4 {
-            let y = last_y - 1;
-            let rm2 = row(y - 2);
-            let rm1 = row(y - 1);
-            let rc = row(y);
-            let rp1 = row(y + 1);                // = last_y
-            let rp2 = row((y + 2).min(last_y));  // y+2 == last_y+1 → clamp to last_y
-            let out = &mut dst[y * dst_stride..][..width];
-            for x in 0..width {
-                out[x].write(
-                    (rm2[x] + rp2[x]) * K5_OUTER
-                    + (rm1[x] + rp1[x]) * K5_INNER
-                    + rc[x] * K5_MID,
-                );
-            }
-        }
-
-        // Interior: y ∈ [2, h-2). Plain 5-tap; this is the SIMD-friendly hot loop.
-        if height >= 5 {
-            for y in 2..height - 2 {
-                let rm2 = row(y - 2);
-                let rm1 = row(y - 1);
-                let rc  = row(y);
-                let rp1 = row(y + 1);
-                let rp2 = row(y + 2);
-                let out = &mut dst[y * dst_stride..][..width];
+            if y == 0 {
+                // Edge: y=0 — H1·H1-derived 3-coefficient form (vertical).
+                let r0 = ring_row(ring, width, 0);
+                let r1 = ring_row(ring, width, 1.min(last_y));
+                let r2 = ring_row(ring, width, 2.min(last_y));
+                for x in 0..width {
+                    out[x].write(K5_EDGE_CENTER * r0[x] + K5_EDGE_NEAR * r1[x] + K5_EDGE_FAR * r2[x]);
+                }
+            } else if y == last_y {
+                // Edge: y=h-1 (mirror of y=0).
+                let rl = ring_row(ring, width, last_y);
+                let rl1 = ring_row(ring, width, last_y - 1);
+                let rl2 = ring_row(ring, width, last_y.saturating_sub(2));
+                for x in 0..width {
+                    out[x].write(K5_EDGE_FAR * rl2[x] + K5_EDGE_NEAR * rl1[x] + K5_EDGE_CENTER * rl[x]);
+                }
+            } else if y == 1 {
+                // Near-edge: y=1 — m2 and m1 both clamp to row 0.
+                let rm = ring_row(ring, width, 0);
+                let rc = ring_row(ring, width, 1);
+                let rp1 = ring_row(ring, width, 2.min(last_y));
+                let rp2 = ring_row(ring, width, 3.min(last_y));
+                for x in 0..width {
+                    out[x].write((rm[x] + rp2[x]) * K5_OUTER + (rm[x] + rp1[x]) * K5_INNER + rc[x] * K5_MID);
+                }
+            } else if y == last_y - 1 {
+                // Near-edge: y=h-2.
+                let rm2 = ring_row(ring, width, y - 2);
+                let rm1 = ring_row(ring, width, y - 1);
+                let rc = ring_row(ring, width, y);
+                let rp1 = ring_row(ring, width, y + 1);                // = last_y
+                let rp2 = ring_row(ring, width, (y + 2).min(last_y));  // clamps to last_y
+                for x in 0..width {
+                    out[x].write((rm2[x] + rp2[x]) * K5_OUTER + (rm1[x] + rp1[x]) * K5_INNER + rc[x] * K5_MID);
+                }
+            } else {
+                // Interior: 2 <= y <= h-3. Plain 5-tap; SIMD hot path.
+                let rm2 = ring_row(ring, width, y - 2);
+                let rm1 = ring_row(ring, width, y - 1);
+                let rc = ring_row(ring, width, y);
+                let rp1 = ring_row(ring, width, y + 1);
+                let rp2 = ring_row(ring, width, y + 2);
                 blur5(rm2, rm1, rc, rp1, rp2, out);
             }
         }
     }
 
-    /// Horizontal 5-tap blur with fused element-wise multiply, bit-equivalent
-    /// to clamped H1·H1 applied to `src1 * src2`. Same edge-handling structure
-    /// as `blur_h5`.
-    #[allow(clippy::too_many_arguments)]
-    fn blur_h5_mul(
-        src1: &[f32],
-        src2: &[f32],
-        dst: &mut [MaybeUninit<f32>],
-        width: usize,
-        height: usize,
-        stride1: usize,
-        stride2: usize,
-    ) {
+    /// Horizontal 5-tap blur of a single row with fused element-wise multiply,
+    /// bit-equivalent to clamped H1·H1 applied to `r1 * r2`. Same edge-handling
+    /// structure as `blur_h5_row`. `r1`, `r2`, `out` must have length `width`.
+    fn blur_h5_mul_row(r1: &[f32], r2: &[f32], out: &mut [MaybeUninit<f32>], width: usize) {
         debug_assert!(width >= 1);
+        debug_assert_eq!(r1.len(), width);
+        debug_assert_eq!(r2.len(), width);
+        debug_assert_eq!(out.len(), width);
         let last = width - 1;
-        for y in 0..height {
-            let r1 = &src1[y * stride1..][..width];
-            let r2 = &src2[y * stride2..][..width];
-            let out = &mut dst[y * width..][..width];
-            let prod = |i: usize| r1[i] * r2[i];
+        let prod = |i: usize| r1[i] * r2[i];
 
-            // Edge: j=0. H1·H1-derived 3-coefficient form on q[i] = r1[i]·r2[i].
-            let q0 = prod(0);
-            let q1 = prod(1.min(last));
-            let q2 = prod(2.min(last));
-            out[0].write(K5_EDGE_CENTER * q0 + K5_EDGE_NEAR * q1 + K5_EDGE_FAR * q2);
+        // Edge: j=0. H1·H1-derived 3-coefficient form on q[i] = r1[i]·r2[i].
+        let q0 = prod(0);
+        let q1 = prod(1.min(last));
+        let q2 = prod(2.min(last));
+        out[0].write(K5_EDGE_CENTER * q0 + K5_EDGE_NEAR * q1 + K5_EDGE_FAR * q2);
 
-            // Edge: j=w-1.
-            if width >= 2 {
-                let ql = prod(last);
-                let ql1 = prod(last - 1);
-                let ql2 = prod(last.saturating_sub(2));
-                out[last].write(K5_EDGE_FAR * ql2 + K5_EDGE_NEAR * ql1 + K5_EDGE_CENTER * ql);
-            }
+        // Edge: j=w-1.
+        if width >= 2 {
+            let ql = prod(last);
+            let ql1 = prod(last - 1);
+            let ql2 = prod(last.saturating_sub(2));
+            out[last].write(K5_EDGE_FAR * ql2 + K5_EDGE_NEAR * ql1 + K5_EDGE_CENTER * ql);
+        }
 
-            // Near-edge: j=1.
-            if width >= 3 {
-                let m2 = prod(0);
-                let m1 = prod(0);
-                let c = prod(1);
-                let p1n = prod(2.min(last));
-                let p2n = prod(3.min(last));
-                out[1].write((m2 + p2n) * K5_OUTER + (m1 + p1n) * K5_INNER + c * K5_MID);
-            }
+        // Near-edge: j=1.
+        if width >= 3 {
+            let m2 = prod(0);
+            let m1 = prod(0);
+            let c = prod(1);
+            let p1n = prod(2.min(last));
+            let p2n = prod(3.min(last));
+            out[1].write((m2 + p2n) * K5_OUTER + (m1 + p1n) * K5_INNER + c * K5_MID);
+        }
 
-            // Near-edge: j=w-2.
-            if width >= 4 {
-                let i = last - 1;
-                let m2 = prod(i - 2);
-                let m1 = prod(i - 1);
-                let c = prod(i);
-                let p1n = prod(i + 1);
-                let p2n = prod((i + 2).min(last));
-                out[i].write((m2 + p2n) * K5_OUTER + (m1 + p1n) * K5_INNER + c * K5_MID);
-            }
+        // Near-edge: j=w-2.
+        if width >= 4 {
+            let i = last - 1;
+            let m2 = prod(i - 2);
+            let m1 = prod(i - 1);
+            let c = prod(i);
+            let p1n = prod(i + 1);
+            let p2n = prod((i + 2).min(last));
+            out[i].write((m2 + p2n) * K5_OUTER + (m1 + p1n) * K5_INNER + c * K5_MID);
+        }
 
-            // Interior: j ∈ [2, w-2). Build five pairs of aligned sub-slices.
-            if width >= 5 {
-                let inner_len = width - 4;
-                let s1_m2 = &r1[..inner_len];
-                let s1_m1 = &r1[1..1 + inner_len];
-                let s1_c  = &r1[2..2 + inner_len];
-                let s1_p1 = &r1[3..3 + inner_len];
-                let s1_p2 = &r1[4..4 + inner_len];
-                let s2_m2 = &r2[..inner_len];
-                let s2_m1 = &r2[1..1 + inner_len];
-                let s2_c  = &r2[2..2 + inner_len];
-                let s2_p1 = &r2[3..3 + inner_len];
-                let s2_p2 = &r2[4..4 + inner_len];
-                let (_, out_rest) = out.split_at_mut(2);
-                let out_inner = &mut out_rest[..inner_len];
-                blur5_mul(
-                    s1_m2, s1_m1, s1_c, s1_p1, s1_p2,
-                    s2_m2, s2_m1, s2_c, s2_p1, s2_p2,
-                    out_inner,
-                );
-            }
+        // Interior: j ∈ [2, w-2). Build five pairs of aligned sub-slices.
+        if width >= 5 {
+            let inner_len = width - 4;
+            let s1_m2 = &r1[..inner_len];
+            let s1_m1 = &r1[1..1 + inner_len];
+            let s1_c  = &r1[2..2 + inner_len];
+            let s1_p1 = &r1[3..3 + inner_len];
+            let s1_p2 = &r1[4..4 + inner_len];
+            let s2_m2 = &r2[..inner_len];
+            let s2_m1 = &r2[1..1 + inner_len];
+            let s2_c  = &r2[2..2 + inner_len];
+            let s2_p1 = &r2[3..3 + inner_len];
+            let s2_p2 = &r2[4..4 + inner_len];
+            let (_, out_rest) = out.split_at_mut(2);
+            let out_inner = &mut out_rest[..inner_len];
+            blur5_mul(
+                s1_m2, s1_m1, s1_c, s1_p1, s1_p2,
+                s2_m2, s2_m1, s2_c, s2_p1, s2_p2,
+                out_inner,
+            );
         }
     }
 
@@ -386,18 +401,21 @@ mod portable {
         debug_assert!(src.pixels().all(|p| p.is_finite()));
 
         let pixels = width * height;
-        assert!(tmp.len() >= pixels);
-        let tmp = &mut tmp[..pixels];
-
         let mut dst_vec: Vec<f32> = Vec::with_capacity(pixels);
         let dst_uninit: &mut [MaybeUninit<f32>] = &mut dst_vec.spare_capacity_mut()[..pixels];
+        let dst_ptr = dst_uninit.as_mut_ptr();
 
-        blur_h5(src.buf(), tmp, width, height, src.stride());
-        // SAFETY: blur_h5 wrote every cell of tmp[..pixels].
-        let tmp_init: &[f32] = unsafe { assume_init_ref(tmp) };
-        blur_v5(tmp_init, dst_uninit, width, height, width);
+        let src_buf = src.buf();
+        let src_stride = src.stride();
+        // SAFETY: dst_ptr is valid for `pixels` cells (stride == width), and the
+        // producer reads `src`, a buffer disjoint from `dst_vec`.
+        unsafe {
+            blur_fused(width, height, dst_ptr, width, tmp, |i, slot| {
+                blur_h5_row(&src_buf[i * src_stride..][..width], slot, width);
+            });
+        }
 
-        // SAFETY: blur_v5 wrote every cell of dst_vec.spare_capacity_mut().
+        // SAFETY: blur_fused wrote every cell of dst_vec.spare_capacity_mut().
         unsafe { dst_vec.set_len(pixels); }
         ImgVec::new(dst_vec, width, height)
     }
@@ -409,31 +427,25 @@ mod portable {
         assert!(width > 0 && width < 1 << 24);
         assert!(height > 0 && height < 1 << 24);
 
-        let pixels = width * height;
-        assert!(tmp.len() >= pixels);
-        let tmp = &mut tmp[..pixels];
-
-        blur_h5(srcdst.buf(), tmp, width, height, stride);
-        // SAFETY: blur_h5 wrote every cell of tmp[..pixels].
-        let tmp_init: &[f32] = unsafe { assume_init_ref(tmp) };
-
-        // Reinterpret the (initialized) destination buffer as MaybeUninit so blur_v5
-        // can reuse its `&mut [MaybeUninit<f32>]` write path. Every pixel inside the
-        // (width,height) window will be overwritten before any further read.
-        let dst_buf = srcdst.buf_mut();
-        // SAFETY: f32 and MaybeUninit<f32> have the same layout; we overwrite every cell.
-        let dst_uninit: &mut [MaybeUninit<f32>] = unsafe {
-            std::slice::from_raw_parts_mut(
-                dst_buf.as_mut_ptr().cast::<MaybeUninit<f32>>(),
-                dst_buf.len(),
-            )
-        };
-
-        blur_v5(tmp_init, dst_uninit, width, height, stride);
+        // Single base provenance for both the source reads and the in-place
+        // output writes. Every source row is read exactly once (into the ring)
+        // before that same row is later overwritten by a vertical output row,
+        // and reads/writes touch disjoint per-row ranges, so this aliasing is
+        // sound. `tmp` is a separate allocation used for the ring buffer.
+        let base = srcdst.buf_mut().as_mut_ptr();
+        let dst_ptr = base.cast::<MaybeUninit<f32>>();
+        // SAFETY: see above and the `blur_fused` safety contract.
+        unsafe {
+            blur_fused(width, height, dst_ptr, stride, tmp, |i, slot| {
+                let row = std::slice::from_raw_parts(base.add(i * stride).cast_const(), width);
+                blur_h5_row(row, slot, width);
+            });
+        }
     }
 
     /// Blur the element-wise product of two images: `blur(src1 * src2)`.
-    /// Fuses the multiply into the horizontal pass, then does a single vertical pass.
+    /// Fuses the multiply into the horizontal pass and streams the vertical
+    /// pass through a 5-row ring buffer (single pass over memory).
     pub fn blur_mul(src1: ImgRef<'_, f32>, src2: ImgRef<'_, f32>, tmp: &mut [MaybeUninit<f32>]) -> Vec<f32> {
         let width = src1.width();
         let height = src1.height();
@@ -443,26 +455,21 @@ mod portable {
         assert!(height > 0 && height < 1 << 24);
 
         let pixels = width * height;
-        assert!(tmp.len() >= pixels);
-        let tmp = &mut tmp[..pixels];
-
         let mut dst_vec: Vec<f32> = Vec::with_capacity(pixels);
         let dst_uninit: &mut [MaybeUninit<f32>] = &mut dst_vec.spare_capacity_mut()[..pixels];
+        let dst_ptr = dst_uninit.as_mut_ptr();
 
-        blur_h5_mul(
-            src1.buf(),
-            src2.buf(),
-            tmp,
-            width,
-            height,
-            src1.stride(),
-            src2.stride(),
-        );
-        // SAFETY: blur_h5_mul wrote every cell of tmp[..pixels].
-        let tmp_init: &[f32] = unsafe { assume_init_ref(tmp) };
-        blur_v5(tmp_init, dst_uninit, width, height, width);
+        let (b1, s1) = (src1.buf(), src1.stride());
+        let (b2, s2) = (src2.buf(), src2.stride());
+        // SAFETY: dst_ptr is valid for `pixels` cells (stride == width), and the
+        // producer reads src1/src2, both disjoint from `dst_vec`.
+        unsafe {
+            blur_fused(width, height, dst_ptr, width, tmp, |i, slot| {
+                blur_h5_mul_row(&b1[i * s1..][..width], &b2[i * s2..][..width], slot, width);
+            });
+        }
 
-        // SAFETY: blur_v5 wrote every cell.
+        // SAFETY: blur_fused wrote every cell.
         unsafe { dst_vec.set_len(pixels); }
         dst_vec
     }
