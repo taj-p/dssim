@@ -1,6 +1,9 @@
 use crate::image::{RGBAPLU, RGBLU};
 use rgb::alt::*;
 use rgb::*;
+#[cfg(not(feature = "threads"))]
+use crate::lieon as rayon;
+use rayon::prelude::*;
 
 /// See `GammaPixel` & `ToRGBAPLU`
 #[doc(hidden)]
@@ -185,14 +188,20 @@ impl<M> GammaPixel for Gray<M> where M: Copy + GammaComponent {
     }
 }
 
-impl<P> ToRGBAPLU for [P] where P: GammaPixel<Output=RGBAPLU> {
+impl<P> ToRGBAPLU for [P]
+where
+    P: GammaPixel<Output = RGBAPLU> + Sync,
+    <P::Component as GammaComponent>::Lut: Sync,
+{
     fn to_rgbaplu(&self) -> Vec<RGBAPLU> {
         let gamma_lut = P::make_lut();
-        self.iter().map(|px| px.to_linear(&gamma_lut)).collect()
+        // par_iter().map().collect() preserves order on both rayon and the
+        // single-threaded `lieon` shim, so the output is identical.
+        self.par_iter().map(|px| px.to_linear(&gamma_lut)).collect()
     }
 
     fn to_rgblu(&self) -> Vec<RGBLU> {
         let gamma_lut = P::make_lut();
-        self.iter().map(|px| px.to_linear(&gamma_lut).rgb()).collect()
+        self.par_iter().map(|px| px.to_linear(&gamma_lut).rgb()).collect()
     }
 }
