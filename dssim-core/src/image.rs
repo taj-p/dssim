@@ -2,6 +2,9 @@
 
 use imgref::*;
 use rgb::*;
+#[cfg(not(feature = "threads"))]
+use crate::lieon as rayon;
+use rayon::prelude::*;
 
 /// RGBA, but: premultiplied alpha, linear (using sRGB primaries, but not its gamma curve), f32 unit scale 0..1
 pub type RGBAPLU = RGBA<f32>;
@@ -212,19 +215,24 @@ impl<T> Downsample for ImgRef<'_, T> where T: Average4 + Copy + Sync + Send {
 
         let half_height = height / 2;
         let half_width = width / 2;
+        let buf = self.buf();
 
+        // Each output row y averages input rows 2y and 2y+1, so rows are
+        // independent. Write them in parallel into the uninitialized tail.
         let mut scaled = Vec::with_capacity(half_width * half_height);
-        scaled.extend(self.buf().chunks(stride * 2).take(half_height).flat_map(|pair| {
-            let (top, bot) = pair.split_at(stride);
-            let top = &top[0..half_width * 2];
-            let bot = &bot[0..half_width * 2];
-
-            top.chunks_exact(2)
-                .zip(bot.chunks_exact(2))
-                .map(|(a, b)| Average4::average4(a[0], a[1], b[0], b[1]))
-        }));
-
-        assert_eq!(half_width * half_height, scaled.len());
+        scaled.spare_capacity_mut()
+            .par_chunks_exact_mut(half_width)
+            .take(half_height)
+            .enumerate()
+            .for_each(|(y, out_row)| {
+                let top = &buf[(2 * y) * stride..][..half_width * 2];
+                let bot = &buf[(2 * y + 1) * stride..][..half_width * 2];
+                for x in 0..half_width {
+                    out_row[x].write(Average4::average4(top[2 * x], top[2 * x + 1], bot[2 * x], bot[2 * x + 1]));
+                }
+            });
+        // SAFETY: every cell of scaled[..half_width*half_height] was written above.
+        unsafe { scaled.set_len(half_width * half_height); }
         Some(Img::new(scaled, half_width, half_height))
     }
 }
