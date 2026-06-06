@@ -5,6 +5,7 @@ use crate::image::ToRGB;
 use crate::image::RGBAPLU;
 use crate::image::RGBLU;
 use imgref::*;
+use std::mem::MaybeUninit;
 #[cfg(not(feature = "threads"))]
 use crate::lieon as rayon;
 use rayon::prelude::*;
@@ -14,10 +15,10 @@ const D65y: f32 = 1.0;
 const D65z: f32 = 1.089;
 
 pub type GBitmap = ImgVec<f32>;
-pub(crate) trait ToLAB {
-    fn to_lab(&self) -> (f32, f32, f32);
-}
 
+// 1.05 (vs the usual 1.16) on L boosts color importance without pushing values
+// outside 0..1; the 86.2/220 and 107.9/220 offsets keep a*/b* positive. The
+// per-pixel RGB->LAB math now lives in the vectorized `lab_transform` below.
 #[inline(always)]
 fn fma_matrix(r: f32, rx: f32, g: f32, gx: f32, b: f32, bx: f32) -> f32 {
     b.mul_add(bx, g.mul_add(gx, r * rx))
@@ -25,26 +26,6 @@ fn fma_matrix(r: f32, rx: f32, g: f32, gx: f32, b: f32, bx: f32) -> f32 {
 
 const EPSILON: f32 = 216. / 24389.;
 const K: f32 = 24389. / (27. * 116.); // http://www.brucelindbloom.com/LContinuity.html
-
-impl ToLAB for RGBLU {
-    fn to_lab(&self) -> (f32, f32, f32) {
-        let fx = fma_matrix(self.r, 0.4124 / D65x, self.g, 0.3576 / D65x, self.b, 0.1805 / D65x);
-        let fy = fma_matrix(self.r, 0.2126 / D65y, self.g, 0.7152 / D65y, self.b, 0.0722 / D65y);
-        let fz = fma_matrix(self.r, 0.0193 / D65z, self.g, 0.1192 / D65z, self.b, 0.9505 / D65z);
-
-        let X = if fx > EPSILON { cbrt_poly(fx) - 16. / 116. } else { K * fx };
-        let Y = if fy > EPSILON { cbrt_poly(fy) - 16. / 116. } else { K * fy };
-        let Z = if fz > EPSILON { cbrt_poly(fz) - 16. / 116. } else { K * fz };
-
-        let lab = (
-            (Y * 1.05f32), // 1.05 instead of 1.16 to boost color importance without pushing colors outside of 1.0 range
-            (500.0 / 220.0f32).mul_add(X - Y, 86.2 / 220.0f32), /* 86 is a fudge to make the value positive */
-            (200.0 / 220.0f32).mul_add(Y - Z, 107.9 / 220.0f32), /* 107 is a fudge to make the value positive */
-        );
-        debug_assert!(lab.0 <= 1.0 && lab.1 <= 1.0 && lab.2 <= 1.0);
-        lab
-    }
-}
 
 #[inline]
 fn cbrt_poly(x: f32) -> f32 {
@@ -60,6 +41,101 @@ fn cbrt_poly(x: f32) -> f32 {
     debug_assert!(y < 1.001);
     debug_assert!(x < 216. / 24389. || y >= 16. / 116.);
     y
+}
+
+/// Branchless form of the L*a*b* `f(t)` companding used per channel:
+/// `if t > EPSILON { cbrt_poly(t) - 16/116 } else { K*t }`. Both arms are
+/// computed and blended so the loop vectorizes; for `t <= EPSILON` the
+/// discarded `cbrt_poly(t)` stays finite for all inputs in `[0, 1]`. The
+/// selected value is bit-identical to the original branched scalar code.
+#[inline(always)]
+fn lab_f(t: f32) -> f32 {
+    let cbrt = cbrt_poly(t) - 16. / 116.;
+    let lin = K * t;
+    if t > EPSILON { cbrt } else { lin }
+}
+
+/// In-place RGB(linear) -> L*a*b* transform over three equal-length planar
+/// slices (`r`/`g`/`b` hold the input on entry and the output L/a/b on exit).
+/// Each element is independent, so this both vectorizes and runs in place.
+/// Bit-identical to `RGBLU::to_lab` (same op order, fused `mul_add`s).
+#[inline(always)]
+fn lab_transform_scalar(r: &mut [f32], g: &mut [f32], b: &mut [f32]) {
+    let n = r.len();
+    let (r, g, b) = (&mut r[..n], &mut g[..n], &mut b[..n]);
+    for i in 0..n {
+        let (rr, gg, bb) = (r[i], g[i], b[i]);
+        let fx = fma_matrix(rr, 0.4124 / D65x, gg, 0.3576 / D65x, bb, 0.1805 / D65x);
+        let fy = fma_matrix(rr, 0.2126 / D65y, gg, 0.7152 / D65y, bb, 0.0722 / D65y);
+        let fz = fma_matrix(rr, 0.0193 / D65z, gg, 0.1192 / D65z, bb, 0.9505 / D65z);
+        let X = lab_f(fx);
+        let Y = lab_f(fy);
+        let Z = lab_f(fz);
+        r[i] = Y * 1.05f32;
+        g[i] = (500.0 / 220.0f32).mul_add(X - Y, 86.2 / 220.0f32);
+        b[i] = (200.0 / 220.0f32).mul_add(Y - Z, 107.9 / 220.0f32);
+    }
+}
+
+/// AVX2/FMA build of `lab_transform_scalar`. The default x86-64 target only
+/// has SSE2 and no FMA, so `mul_add` there lowers to a (slow) libm `fmaf`
+/// call; under `avx2,fma` it becomes hardware `vfmadd` over 8 lanes. Results
+/// are bit-identical (both `mul_add`s are correctly-rounded fused ops; no
+/// fast-math).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn lab_transform_avx2(r: &mut [f32], g: &mut [f32], b: &mut [f32]) {
+    lab_transform_scalar(r, g, b);
+}
+
+/// Runtime-dispatched `lab_transform_scalar`.
+#[inline]
+fn lab_transform(r: &mut [f32], g: &mut [f32], b: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: only reached after confirming AVX2+FMA are present.
+        unsafe { lab_transform_avx2(r, g, b) };
+        return;
+    }
+    lab_transform_scalar(r, g, b);
+}
+
+/// Grayscale companding: `if fy > EPSILON { (cbrt_poly(fy)-16/116)*1.16 } else { (K*1.16)*fy }`,
+/// branchless and in place. Bit-identical to the original `GBitmap::to_lab` closure.
+#[inline(always)]
+fn gray_lab_scalar(v: &mut [f32]) {
+    for x in v.iter_mut() {
+        let fy = *x;
+        let cbrt = (cbrt_poly(fy) - 16. / 116.) * 1.16;
+        let lin = (K * 1.16) * fy;
+        *x = if fy > EPSILON { cbrt } else { lin };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gray_lab_avx2(v: &mut [f32]) {
+    gray_lab_scalar(v);
+}
+
+/// Runtime-dispatched `gray_lab_scalar`.
+#[inline]
+fn gray_lab(v: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: only reached after confirming AVX2+FMA are present.
+        unsafe { gray_lab_avx2(v) };
+        return;
+    }
+    gray_lab_scalar(v);
+}
+
+/// Promote `&mut [MaybeUninit<f32>]` to `&mut [f32]` once every cell is written.
+/// SAFETY: every cell of `s` must have been initialized.
+#[inline(always)]
+unsafe fn assume_init_mut(s: &mut [MaybeUninit<f32>]) -> &mut [f32] {
+    // SAFETY: f32 and MaybeUninit<f32> share layout; caller guarantees init.
+    unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr().cast::<f32>(), s.len()) }
 }
 
 /// Convert image to L\*a\*b\* planar
@@ -84,26 +160,39 @@ impl ToLABBitmap for ImgVec<RGBLU> {
 }
 impl ToLABBitmap for GBitmap {
     fn to_lab(&self) -> Vec<GBitmap> {
-        debug_assert!(self.width() > 0);
-        let f = |fy| {
-            if fy > EPSILON { (cbrt_poly(fy) - 16. / 116.) * 1.16 } else { (K * 1.16) * fy }
-        };
+        let width = self.width();
+        let height = self.height();
+        debug_assert!(width > 0);
+        let area = width * height;
 
-        #[cfg(feature = "threads")]
-        let out = (0..self.height()).into_par_iter().flat_map_iter(|y| {
-            self[y].iter().map(|&fy| f(fy))
-        }).collect();
+        let mut out: Vec<f32> = Vec::with_capacity(area);
+        out.spare_capacity_mut()
+            .par_chunks_exact_mut(width)
+            .take(height)
+            .enumerate()
+            .for_each(|(y, out_row)| {
+                let in_row = &self[y][0..width];
+                let out_row = &mut out_row[0..width];
+                for x in 0..width {
+                    out_row[x].write(in_row[x]);
+                }
+                // SAFETY: every cell of out_row was written above.
+                gray_lab(unsafe { assume_init_mut(out_row) });
+            });
+        // SAFETY: every row (hence every cell) was written above.
+        unsafe { out.set_len(area) };
 
-        #[cfg(not(feature = "threads"))]
-        let out = self.pixels().map(f).collect();
-
-        vec![Self::new(out, self.width(), self.height())]
+        vec![Self::new(out, width, height)]
     }
 }
 
+/// `to_rgb` produces the (possibly dithered) linear RGB triplet for one input
+/// pixel; the heavy RGB->LAB math is then applied per row by the vectorized,
+/// AVX2-dispatched `lab_transform`. The cheap, branchy deinterleave/dither
+/// stays scalar so the SIMD kernel is branch-free.
 #[inline(never)]
-fn rgb_to_lab<T: Copy + Sync + Send + 'static, F>(img: ImgRef<'_, T>, cb: F) -> Vec<GBitmap>
-    where F: Fn(T, usize) -> (f32, f32, f32) + Sync + Send + 'static
+fn rgb_to_lab<T: Copy + Sync + Send + 'static, F>(img: ImgRef<'_, T>, to_rgb: F) -> Vec<GBitmap>
+    where F: Fn(T, usize) -> RGBLU + Sync + Send + 'static
 {
     let width = img.width();
     assert!(width > 0);
@@ -124,13 +213,20 @@ fn rgb_to_lab<T: Copy + Sync + Send + 'static, F>(img: ImgRef<'_, T>, cb: F) -> 
         let l_row = &mut l_row[0..width];
         let a_row = &mut a_row[0..width];
         let b_row = &mut b_row[0..width];
+        // Phase 1 (scalar): deinterleave + dither into the output rows as r/g/b.
         for x in 0..width {
-            let n = (x+11) ^ (y+11);
-            let (l,a,b) = cb(in_row[x], n);
-            l_row[x].write(l);
-            a_row[x].write(a);
-            b_row[x].write(b);
+            let n = (x + 11) ^ (y + 11);
+            let rgb = to_rgb(in_row[x], n);
+            l_row[x].write(rgb.r);
+            a_row[x].write(rgb.g);
+            b_row[x].write(rgb.b);
         }
+        // Phase 2 (SIMD): in-place RGB->LAB over the row.
+        // SAFETY: phase 1 wrote every cell of each row.
+        let r = unsafe { assume_init_mut(l_row) };
+        let g = unsafe { assume_init_mut(a_row) };
+        let b = unsafe { assume_init_mut(b_row) };
+        lab_transform(r, g, b);
     });
 
     unsafe { out_l.set_len(area) };
@@ -147,18 +243,14 @@ fn rgb_to_lab<T: Copy + Sync + Send + 'static, F>(img: ImgRef<'_, T>, cb: F) -> 
 impl ToLABBitmap for ImgRef<'_, RGBAPLU> {
     #[inline]
     fn to_lab(&self) -> Vec<GBitmap> {
-        rgb_to_lab(*self, |px, n|{
-            px.to_rgb(n).to_lab()
-        })
+        rgb_to_lab(*self, |px, n| px.to_rgb(n))
     }
 }
 
 impl ToLABBitmap for ImgRef<'_, RGBLU> {
     #[inline]
     fn to_lab(&self) -> Vec<GBitmap> {
-        rgb_to_lab(*self, |px, _n|{
-            px.to_lab()
-        })
+        rgb_to_lab(*self, |px, _n| px)
     }
 }
 
