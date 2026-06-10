@@ -6,6 +6,12 @@
 #![allow(clippy::manual_range_contains)]
 #![allow(clippy::new_without_default)]
 
+// Measurement-only: use mimalloc as the global allocator under tests/benches
+// when the `bench-mimalloc` feature is on, to bound allocation overhead.
+#[cfg(all(test, feature = "bench-mimalloc"))]
+#[global_allocator]
+static GLOBAL_MIMALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod blur;
 mod c_api;
 mod dssim;
