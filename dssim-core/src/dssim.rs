@@ -266,7 +266,7 @@ impl Dssim {
         let (chan, _) = rayon::join({
             let image = image.clone();
             move || {
-                let lab = image.to_lab();
+                let lab = image.to_lab_pooled(pool);
                 drop(image); // Free larger RGB image ASAP
                 DssimChanScale {
                     chan: lab.into_par_iter().with_max_len(1).enumerate().map(|(n,l)| {

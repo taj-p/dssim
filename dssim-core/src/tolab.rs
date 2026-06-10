@@ -4,6 +4,7 @@
 use crate::image::ToRGB;
 use crate::image::RGBAPLU;
 use crate::image::RGBLU;
+use crate::pool::DssimPool;
 use imgref::*;
 use std::mem::MaybeUninit;
 #[cfg(not(feature = "threads"))]
@@ -143,12 +144,24 @@ unsafe fn assume_init_mut(s: &mut [MaybeUninit<f32>]) -> &mut [f32] {
 /// It should return 1 (gray) or 3 (color) planes.
 pub trait ToLABBitmap {
     fn to_lab(&self) -> Vec<GBitmap>;
+
+    /// Like [`ToLABBitmap::to_lab`], but draws its output planes from `pool`
+    /// for reuse across calls. The default ignores the pool, so custom pixel
+    /// types keep working unchanged; the built-in types override it.
+    #[inline]
+    fn to_lab_pooled(&self, _pool: &DssimPool) -> Vec<GBitmap> {
+        self.to_lab()
+    }
 }
 
 impl ToLABBitmap for ImgVec<RGBAPLU> {
     #[inline(always)]
     fn to_lab(&self) -> Vec<GBitmap> {
         self.as_ref().to_lab()
+    }
+    #[inline(always)]
+    fn to_lab_pooled(&self, pool: &DssimPool) -> Vec<GBitmap> {
+        self.as_ref().to_lab_pooled(pool)
     }
 }
 
@@ -157,15 +170,23 @@ impl ToLABBitmap for ImgVec<RGBLU> {
     fn to_lab(&self) -> Vec<GBitmap> {
         self.as_ref().to_lab()
     }
+    #[inline(always)]
+    fn to_lab_pooled(&self, pool: &DssimPool) -> Vec<GBitmap> {
+        self.as_ref().to_lab_pooled(pool)
+    }
 }
 impl ToLABBitmap for GBitmap {
+    #[inline(always)]
     fn to_lab(&self) -> Vec<GBitmap> {
+        self.to_lab_pooled(&DssimPool::new())
+    }
+    fn to_lab_pooled(&self, pool: &DssimPool) -> Vec<GBitmap> {
         let width = self.width();
         let height = self.height();
         debug_assert!(width > 0);
         let area = width * height;
 
-        let mut out: Vec<f32> = Vec::with_capacity(area);
+        let mut out: Vec<f32> = pool.take(area);
         out.spare_capacity_mut()
             .par_chunks_exact_mut(width)
             .take(height)
@@ -191,7 +212,7 @@ impl ToLABBitmap for GBitmap {
 /// AVX2-dispatched `lab_transform`. The cheap, branchy deinterleave/dither
 /// stays scalar so the SIMD kernel is branch-free.
 #[inline(never)]
-fn rgb_to_lab<T: Copy + Sync + Send + 'static, F>(img: ImgRef<'_, T>, to_rgb: F) -> Vec<GBitmap>
+fn rgb_to_lab<T: Copy + Sync + Send + 'static, F>(img: ImgRef<'_, T>, to_rgb: F, pool: &DssimPool) -> Vec<GBitmap>
     where F: Fn(T, usize) -> RGBLU + Sync + Send + 'static
 {
     let width = img.width();
@@ -199,9 +220,10 @@ fn rgb_to_lab<T: Copy + Sync + Send + 'static, F>(img: ImgRef<'_, T>, to_rgb: F)
     let height = img.height();
     let area = width * height;
 
-    let mut out_l = Vec::with_capacity(area);
-    let mut out_a = Vec::with_capacity(area);
-    let mut out_b = Vec::with_capacity(area);
+    // Output planes come from the pool so they are reused across calls.
+    let mut out_l = pool.take(area);
+    let mut out_a = pool.take(area);
+    let mut out_b = pool.take(area);
 
     // For output width == stride
     out_l.spare_capacity_mut().par_chunks_exact_mut(width).take(height).zip(
@@ -243,14 +265,22 @@ fn rgb_to_lab<T: Copy + Sync + Send + 'static, F>(img: ImgRef<'_, T>, to_rgb: F)
 impl ToLABBitmap for ImgRef<'_, RGBAPLU> {
     #[inline]
     fn to_lab(&self) -> Vec<GBitmap> {
-        rgb_to_lab(*self, |px, n| px.to_rgb(n))
+        self.to_lab_pooled(&DssimPool::new())
+    }
+    #[inline]
+    fn to_lab_pooled(&self, pool: &DssimPool) -> Vec<GBitmap> {
+        rgb_to_lab(*self, |px, n| px.to_rgb(n), pool)
     }
 }
 
 impl ToLABBitmap for ImgRef<'_, RGBLU> {
     #[inline]
     fn to_lab(&self) -> Vec<GBitmap> {
-        rgb_to_lab(*self, |px, _n| px)
+        self.to_lab_pooled(&DssimPool::new())
+    }
+    #[inline]
+    fn to_lab_pooled(&self, pool: &DssimPool) -> Vec<GBitmap> {
+        rgb_to_lab(*self, |px, _n| px, pool)
     }
 }
 
