@@ -308,8 +308,28 @@ impl Dssim {
 
     /// Create both images, compare them, and return all of their buffers to
     /// `pool` - the convenient one-call entry point for comparing many
-    /// independent pairs while recycling buffers. Reuse a single `DssimPool`
-    /// across the whole batch.
+    /// independent pairs while recycling buffers. Reuse a single [`DssimPool`]
+    /// across the whole batch so the large per-pair allocations are recycled
+    /// instead of returned to the allocator each time. This is allocator
+    /// agnostic - it needs no `#[global_allocator]`.
+    ///
+    /// ```
+    /// use dssim_core::{Dssim, DssimPool, ToRGBAPLU};
+    /// use imgref::Img;
+    /// use rgb::RGBA;
+    ///
+    /// let attr = Dssim::new();
+    /// let pool = DssimPool::new();
+    ///
+    /// let (w, h) = (80, 80);
+    /// let a = Img::new(vec![RGBA::<u8>::new(10, 20, 30, 255); w * h].to_rgbaplu(), w, h);
+    /// let b = Img::new(vec![RGBA::<u8>::new(12, 22, 28, 255); w * h].to_rgbaplu(), w, h);
+    ///
+    /// // Reuse one pool across the whole batch of pairs.
+    /// for _ in 0..1000 {
+    ///     let (_score, _maps) = attr.compare_pair_in(&pool, &a, &b).unwrap();
+    /// }
+    /// ```
     pub fn compare_pair_in<InBitmap, OutBitmap>(&self, pool: &DssimPool, original: &InBitmap, modified: &InBitmap) -> Option<(Val, Vec<SsimMap>)>
     where
         InBitmap: ToLABBitmap + Send + Sync + Downsample<Output = OutBitmap>,
