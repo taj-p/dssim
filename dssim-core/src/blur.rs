@@ -394,6 +394,13 @@ mod portable {
     }
 
     pub fn blur(src: ImgRef<'_, f32>, tmp: &mut [MaybeUninit<f32>]) -> ImgVec<f32> {
+        blur_into(src, tmp, Vec::new())
+    }
+
+    /// Like [`blur`], but writes into `dst_vec` (its existing capacity is
+    /// reused), so the output buffer can come from a pool. The contents of
+    /// `dst_vec` are discarded.
+    pub fn blur_into(src: ImgRef<'_, f32>, tmp: &mut [MaybeUninit<f32>], mut dst_vec: Vec<f32>) -> ImgVec<f32> {
         let width = src.width();
         let height = src.height();
         assert!(width > 0 && width < 1 << 24);
@@ -401,7 +408,8 @@ mod portable {
         debug_assert!(src.pixels().all(|p| p.is_finite()));
 
         let pixels = width * height;
-        let mut dst_vec: Vec<f32> = Vec::with_capacity(pixels);
+        dst_vec.clear();
+        dst_vec.reserve(pixels);
         let dst_uninit: &mut [MaybeUninit<f32>] = &mut dst_vec.spare_capacity_mut()[..pixels];
         let dst_ptr = dst_uninit.as_mut_ptr();
 
@@ -447,6 +455,13 @@ mod portable {
     /// Fuses the multiply into the horizontal pass and streams the vertical
     /// pass through a 5-row ring buffer (single pass over memory).
     pub fn blur_mul(src1: ImgRef<'_, f32>, src2: ImgRef<'_, f32>, tmp: &mut [MaybeUninit<f32>]) -> Vec<f32> {
+        blur_mul_into(src1, src2, tmp, Vec::new())
+    }
+
+    /// Like [`blur_mul`], but writes into `dst_vec` (its existing capacity is
+    /// reused), so the output buffer can come from a pool. The contents of
+    /// `dst_vec` are discarded.
+    pub fn blur_mul_into(src1: ImgRef<'_, f32>, src2: ImgRef<'_, f32>, tmp: &mut [MaybeUninit<f32>], mut dst_vec: Vec<f32>) -> Vec<f32> {
         let width = src1.width();
         let height = src1.height();
         debug_assert_eq!(width, src2.width());
@@ -455,7 +470,8 @@ mod portable {
         assert!(height > 0 && height < 1 << 24);
 
         let pixels = width * height;
-        let mut dst_vec: Vec<f32> = Vec::with_capacity(pixels);
+        dst_vec.clear();
+        dst_vec.reserve(pixels);
         let dst_uninit: &mut [MaybeUninit<f32>] = &mut dst_vec.spare_capacity_mut()[..pixels];
         let dst_ptr = dst_uninit.as_mut_ptr();
 
