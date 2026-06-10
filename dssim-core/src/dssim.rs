@@ -22,6 +22,7 @@
 use crate::blur;
 use crate::image::*;
 use crate::linear::ToRGBAPLU;
+use crate::pool::DssimPool;
 pub use crate::tolab::ToLABBitmap;
 pub use crate::val::Dssim as Val;
 use imgref::*;
@@ -36,7 +37,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 trait Channable<T, I> {
-    fn img1_img2_blur(&self, modified: &Self, tmp: &mut [MaybeUninit<I>]) -> Vec<T>;
+    fn img1_img2_blur(&self, modified: &Self, tmp: &mut [MaybeUninit<I>], pool: &DssimPool) -> Vec<T>;
 }
 
 #[derive(Clone)]
@@ -81,6 +82,25 @@ impl<T> DssimImage<T> {
     }
 }
 
+impl DssimPool {
+    /// Return all of a created image's large buffers (LAB planes, blurred
+    /// means, squared-image blurs) to the pool so the next
+    /// [`Dssim::create_image_in`] / [`Dssim::compare_in`] can reuse them. Use
+    /// this once you are done with an image created via
+    /// [`Dssim::create_image_in`]; [`Dssim::compare_pair_in`] does it for you.
+    pub fn reclaim(&self, image: DssimImage<f32>) {
+        for scale in image.scale {
+            for chan in scale.chan {
+                if let Some(img) = chan.img {
+                    self.give(img.into_contiguous_buf().0);
+                }
+                self.give(chan.mu);
+                self.give(chan.img_sq_blur);
+            }
+        }
+    }
+}
+
 // Weighed scales are inspired by the IW-SSIM, but details of the algorithm and weights are different
 const DEFAULT_WEIGHTS: [f64; 5] = [0.028, 0.197, 0.322, 0.298, 0.155];
 
@@ -115,36 +135,44 @@ impl DssimChan<f32> {
 }
 
 impl DssimChan<f32> {
-    fn preprocess(&mut self, tmp: &mut [MaybeUninit<f32>]) {
+    fn preprocess(&mut self, pool: &DssimPool) {
         let width = self.width;
         let height = self.height;
         assert!(width > 0);
         assert!(height > 0);
+        let pixels = width * height;
 
         let img = self.img.as_mut().unwrap();
-        debug_assert_eq!(width * height, img.pixels().count());
+        debug_assert_eq!(pixels, img.pixels().count());
         debug_assert!(img.pixels().all(f32::is_finite));
 
-        if self.is_chroma {
-            blur::blur_in_place(img.as_mut(), tmp);
-        }
-        let (mu, ..) = blur::blur(img.as_ref(), tmp).into_contiguous_buf();
-        self.mu = mu;
+        // Scratch + the two retained outputs (mu, img_sq_blur) all come from
+        // the pool so they are recycled across comparisons.
+        let mut scratch = pool.take(pixels);
+        {
+            let tmp = &mut scratch.spare_capacity_mut()[..pixels];
+            if self.is_chroma {
+                blur::blur_in_place(img.as_mut(), tmp);
+            }
+            self.mu = blur::blur_into(img.as_ref(), tmp, pool.take(pixels)).into_contiguous_buf().0;
 
-        // Fused squared-image blur: blur_mul(img, img) does a single H5*V5 pass
-        // over img*img, avoiding both the materialized i*i vector and the
-        // separate in-place blur over it.
-        self.img_sq_blur = blur::blur_mul(img.as_ref(), img.as_ref(), tmp);
-        debug_assert_eq!(self.img_sq_blur.len(), width * height);
+            // Fused squared-image blur: blur_mul(img, img) does a single H5*V5 pass
+            // over img*img, avoiding both the materialized i*i vector and the
+            // separate in-place blur over it.
+            self.img_sq_blur = blur::blur_mul_into(img.as_ref(), img.as_ref(), tmp, pool.take(pixels));
+        }
+        pool.give(scratch);
+        debug_assert_eq!(self.img_sq_blur.len(), pixels);
     }
 }
 
 impl Channable<f32, f32> for DssimChan<f32> {
-    fn img1_img2_blur(&self, modified: &Self, tmp32: &mut [MaybeUninit<f32>]) -> Vec<f32> {
+    fn img1_img2_blur(&self, modified: &Self, tmp32: &mut [MaybeUninit<f32>], pool: &DssimPool) -> Vec<f32> {
         let src = self.img.as_ref().unwrap();
         let modified_img = modified.img.as_ref().unwrap();
         // Fused multiply+blur: avoids materializing the product as a Vec.
-        blur::blur_mul(src.as_ref(), modified_img.as_ref(), tmp32)
+        // Output buffer comes from the pool.
+        blur::blur_mul_into(src.as_ref(), modified_img.as_ref(), tmp32, pool.take(self.width * self.height))
     }
 }
 
@@ -207,16 +235,29 @@ impl Dssim {
         InBitmap: ToLABBitmap + Send + Sync + Downsample<Output = OutBitmap>,
         OutBitmap: ToLABBitmap + Send + Sync + Downsample<Output = OutBitmap>,
     {
+        // A transient pool gives behavior identical to allocating directly,
+        // while still reusing scratch within this one call.
+        self.create_image_in(&DssimPool::new(), src_img)
+    }
+
+    /// Like [`Dssim::create_image`], but sources buffers from `pool` and so
+    /// reuses them across calls. Pair this with [`DssimPool::reclaim`] (or use
+    /// [`Dssim::compare_pair_in`]) to return the image's buffers when done.
+    pub fn create_image_in<InBitmap, OutBitmap>(&self, pool: &DssimPool, src_img: &InBitmap) -> Option<DssimImage<f32>>
+    where
+        InBitmap: ToLABBitmap + Send + Sync + Downsample<Output = OutBitmap>,
+        OutBitmap: ToLABBitmap + Send + Sync + Downsample<Output = OutBitmap>,
+    {
         let num_scales = self.scale_weights.len();
         let mut scale = Vec::with_capacity(num_scales);
-        Self::make_scales_recursive(num_scales, MaybeArc::Borrowed(src_img), &mut scale);
+        Self::make_scales_recursive(pool, num_scales, MaybeArc::Borrowed(src_img), &mut scale);
         scale.reverse(); // depth-first made smallest scales first
 
         Some(DssimImage { scale })
     }
 
     #[inline(never)]
-    fn make_scales_recursive<InBitmap, OutBitmap>(scales_left: usize, image: MaybeArc<'_, InBitmap>, scales: &mut Vec<DssimChanScale<f32>>)
+    fn make_scales_recursive<InBitmap, OutBitmap>(pool: &DssimPool, scales_left: usize, image: MaybeArc<'_, InBitmap>, scales: &mut Vec<DssimChanScale<f32>>)
     where
         InBitmap: ToLABBitmap + Send + Sync + Downsample<Output = OutBitmap>,
         OutBitmap: ToLABBitmap + Send + Sync + Downsample<Output = OutBitmap>,
@@ -229,13 +270,8 @@ impl Dssim {
                 drop(image); // Free larger RGB image ASAP
                 DssimChanScale {
                     chan: lab.into_par_iter().with_max_len(1).enumerate().map(|(n,l)| {
-                        let w = l.width();
-                        let h = l.height();
                         let mut ch = DssimChan::new(l, n > 0);
-
-                        let pixels = w * h;
-                        let mut tmp = Vec::with_capacity(pixels);
-                        ch.preprocess(&mut tmp.spare_capacity_mut()[..pixels]);
+                        ch.preprocess(pool);
                         ch
                     }).collect(),
                 }
@@ -247,7 +283,7 @@ impl Dssim {
                     let down = image.downsample();
                     drop(image);
                     if let Some(downsampled) = down {
-                        Self::make_scales_recursive(scales_left - 1, MaybeArc::Owned(Arc::new(downsampled)), scales);
+                        Self::make_scales_recursive(pool, scales_left - 1, MaybeArc::Owned(Arc::new(downsampled)), scales);
                     }
                 }
             }
@@ -261,11 +297,34 @@ impl Dssim {
     ///
     /// `Val` is a fancy wrapper for `f64`
     pub fn compare<M: Borrow<DssimImage<f32>>>(&self, original_image: &DssimImage<f32>, modified_image: M) -> (Val, Vec<SsimMap>) {
-        self.compare_inner(original_image, modified_image.borrow())
+        self.compare_inner(&DssimPool::new(), original_image, modified_image.borrow())
+    }
+
+    /// Like [`Dssim::compare`], but sources its scratch/intermediate buffers
+    /// from `pool` so they are reused across comparisons.
+    pub fn compare_in<M: Borrow<DssimImage<f32>>>(&self, pool: &DssimPool, original_image: &DssimImage<f32>, modified_image: M) -> (Val, Vec<SsimMap>) {
+        self.compare_inner(pool, original_image, modified_image.borrow())
+    }
+
+    /// Create both images, compare them, and return all of their buffers to
+    /// `pool` - the convenient one-call entry point for comparing many
+    /// independent pairs while recycling buffers. Reuse a single `DssimPool`
+    /// across the whole batch.
+    pub fn compare_pair_in<InBitmap, OutBitmap>(&self, pool: &DssimPool, original: &InBitmap, modified: &InBitmap) -> Option<(Val, Vec<SsimMap>)>
+    where
+        InBitmap: ToLABBitmap + Send + Sync + Downsample<Output = OutBitmap>,
+        OutBitmap: ToLABBitmap + Send + Sync + Downsample<Output = OutBitmap>,
+    {
+        let orig = self.create_image_in(pool, original)?;
+        let modif = self.create_image_in(pool, modified)?;
+        let result = self.compare_inner(pool, &orig, &modif);
+        pool.reclaim(orig);
+        pool.reclaim(modif);
+        Some(result)
     }
 
     #[inline(never)]
-    fn compare_inner(&self, original_image: &DssimImage<f32>, modified_image: &DssimImage<f32>) -> (Val, Vec<SsimMap>) {
+    fn compare_inner(&self, pool: &DssimPool, original_image: &DssimImage<f32>, modified_image: &DssimImage<f32>) -> (Val, Vec<SsimMap>) {
         let scaled_images_iter = modified_image.scale.iter().zip(original_image.scale.iter());
         // Materialize the per-scale work items, then drive them with an
         // indexed parallel iterator. This avoids par_bridge's mutex-based
@@ -282,20 +341,26 @@ impl Dssim {
                 3 => {
                     // Compute the per-channel cross-blur (img1·img2 then blur) for L, a, b
                     // in parallel — three independent blurs over disjoint memory.
-                    // Each channel gets its own tmp buffer.
+                    // Scratch and the cross-blur outputs come from the pool.
                     let img1_img2_blur: Vec<Vec<f32>> = (0..3usize).into_par_iter().map(|c| {
-                        let mut tmp_buf: Vec<f32> = Vec::with_capacity(pixels);
-                        let tmp = &mut tmp_buf.spare_capacity_mut()[..pixels];
-                        original_image_scale.chan[c]
-                            .img1_img2_blur(&modified_image_scale.chan[c], tmp)
+                        let mut tmp_buf = pool.take(pixels);
+                        let out = original_image_scale.chan[c]
+                            .img1_img2_blur(&modified_image_scale.chan[c], &mut tmp_buf.spare_capacity_mut()[..pixels], pool);
+                        pool.give(tmp_buf);
+                        out
                     }).collect();
-                    Self::compare_scale_3ch(original_image_scale, modified_image_scale, &img1_img2_blur)
+                    let map = Self::compare_scale_3ch(original_image_scale, modified_image_scale, &img1_img2_blur);
+                    // Return the cross-blur buffers to the pool for the next comparison.
+                    for buf in img1_img2_blur { pool.give(buf); }
+                    map
                 },
                 1 => {
-                    let mut tmp_buf: Vec<f32> = Vec::with_capacity(pixels);
-                    let tmp = &mut tmp_buf.spare_capacity_mut()[..pixels];
-                    let img1_img2_blur = original_image_scale.chan[0].img1_img2_blur(&modified_image_scale.chan[0], tmp);
-                    Self::compare_scale(&original_image_scale.chan[0], &modified_image_scale.chan[0], &img1_img2_blur)
+                    let mut tmp_buf = pool.take(pixels);
+                    let img1_img2_blur = original_image_scale.chan[0].img1_img2_blur(&modified_image_scale.chan[0], &mut tmp_buf.spare_capacity_mut()[..pixels], pool);
+                    pool.give(tmp_buf);
+                    let map = Self::compare_scale(&original_image_scale.chan[0], &modified_image_scale.chan[0], &img1_img2_blur);
+                    pool.give(img1_img2_blur);
+                    map
                 },
                 _ => panic!(),
             };
@@ -579,6 +644,42 @@ impl<T> Deref for MaybeArc<'_, T> {
 }
 
 #[test]
+fn pooled_matches_unpooled() {
+    use crate::linear::*;
+    use imgref::*;
+
+    let d = new();
+    let file1 = lodepng::decode32_file("../tests/test1-sm.png").unwrap();
+    let file2 = lodepng::decode32_file("../tests/test2-sm.png").unwrap();
+    let buf1 = &file1.buffer.to_rgbaplu()[..];
+    let buf2 = &file2.buffer.to_rgbaplu()[..];
+    let i1 = Img::new(buf1, file1.width, file1.height);
+    let i2 = Img::new(buf2, file2.width, file2.height);
+
+    // Reference via the normal (transient-pool) path.
+    let a = d.create_image(&i1).unwrap();
+    let b = d.create_image(&i2).unwrap();
+    let (want, _) = d.compare(&a, b);
+
+    // Pooled path, reusing one pool across several pairs to exercise buffer
+    // recycling. Results must be bit-identical (pooling only changes which
+    // allocation a buffer lives in).
+    let pool = DssimPool::new();
+    for _ in 0..3 {
+        let (got, _) = d.compare_pair_in(&pool, &i1, &i2).unwrap();
+        assert_eq!(f64::from(want), f64::from(got), "pooled compare diverged from unpooled");
+    }
+
+    // create_image_in + compare_in + reclaim should also match.
+    let a2 = d.create_image_in(&pool, &i1).unwrap();
+    let b2 = d.create_image_in(&pool, &i2).unwrap();
+    let (got2, _) = d.compare_in(&pool, &a2, &b2);
+    assert_eq!(f64::from(want), f64::from(got2));
+    pool.reclaim(a2);
+    pool.reclaim(b2);
+}
+
+#[test]
 fn poison() {
     let a = RGBAPLU::new(1.,1.,1.,1.);
     let b = RGBAPLU::new(0.,0.,0.,0.);
@@ -649,9 +750,24 @@ mod pair_bench {
         });
     }
 
+    // Reuses a single DssimPool across iterations, modelling a long-running
+    // pipeline that compares many independent pairs.
+    fn bench_compare_pair_pooled(b: &mut Bencher, w: usize, h: usize) {
+        let attr = Dssim::new();
+        let a = img(w, h, 0x1234_5678);
+        let c = img(w, h, 0x9E37_79B9);
+        let pool = crate::DssimPool::new();
+        b.iter(|| {
+            test::black_box(attr.compare_pair_in(&pool, test::black_box(&a), test::black_box(&c)))
+        });
+    }
+
     #[bench] fn create_pair_1024x768(b: &mut Bencher) { bench_create_pair(b, 1024, 768); }
     #[bench] fn create_pair_1920x1080(b: &mut Bencher) { bench_create_pair(b, 1920, 1080); }
 
     #[bench] fn compare_pair_1024x768(b: &mut Bencher) { bench_compare_pair(b, 1024, 768); }
     #[bench] fn compare_pair_1920x1080(b: &mut Bencher) { bench_compare_pair(b, 1920, 1080); }
+
+    #[bench] fn compare_pair_pooled_1024x768(b: &mut Bencher) { bench_compare_pair_pooled(b, 1024, 768); }
+    #[bench] fn compare_pair_pooled_1920x1080(b: &mut Bencher) { bench_compare_pair_pooled(b, 1920, 1080); }
 }

@@ -21,9 +21,6 @@ mod image;
 #[cfg(not(feature = "threads"))]
 mod lieon;
 mod linear;
-// `dead_code` allow is temporary: take/give are wired into the create/compare
-// paths in the following commits.
-#[allow(dead_code)]
 mod pool;
 mod tolab;
 mod val;

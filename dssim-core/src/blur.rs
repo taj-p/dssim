@@ -393,6 +393,9 @@ mod portable {
         unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<f32>(), slice.len()) }
     }
 
+    /// Convenience wrapper that allocates the output. Production paths use
+    /// [`blur_into`] with a pooled buffer; kept for tests and external use.
+    #[allow(dead_code)]
     pub fn blur(src: ImgRef<'_, f32>, tmp: &mut [MaybeUninit<f32>]) -> ImgVec<f32> {
         blur_into(src, tmp, Vec::new())
     }
@@ -454,6 +457,9 @@ mod portable {
     /// Blur the element-wise product of two images: `blur(src1 * src2)`.
     /// Fuses the multiply into the horizontal pass and streams the vertical
     /// pass through a 5-row ring buffer (single pass over memory).
+    /// Production paths use [`blur_mul_into`] with a pooled buffer; this
+    /// allocating wrapper is kept for tests and external use.
+    #[allow(dead_code)]
     pub fn blur_mul(src1: ImgRef<'_, f32>, src2: ImgRef<'_, f32>, tmp: &mut [MaybeUninit<f32>]) -> Vec<f32> {
         blur_mul_into(src1, src2, tmp, Vec::new())
     }
