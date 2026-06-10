@@ -29,3 +29,9 @@ pub use crate::dssim::*;
 pub use crate::image::*;
 pub use crate::linear::*;
 pub use crate::pool::DssimPool;
+
+/// Re-export of the `imgref` crate, whose `ImgVec`/`ImgRef` types are the input
+/// bitmaps accepted by [`Dssim::create_image`] and the pooled
+/// [`Dssim::compare_pair_in`]. Re-exported so callers can construct inputs
+/// without taking their own (version-matched) `imgref` dependency.
+pub use imgref;
