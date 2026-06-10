@@ -599,3 +599,59 @@ fn poison() {
     let (res, _) = d.compare(&sub_img1, sub_img2);
     assert!(res < 0.000001);
 }
+
+// Representative end-to-end benchmarks for the large-image, many-pairs
+// workload. Run with: RUSTC_BOOTSTRAP=1 cargo bench -p dssim-core
+#[cfg(test)]
+mod pair_bench {
+    extern crate test;
+    use super::Dssim;
+    use crate::image::RGBAPLU;
+    use imgref::*;
+    use test::Bencher;
+
+    // Deterministic synthetic premultiplied-linear image (r,g,b <= a, all 0..1).
+    fn img(w: usize, h: usize, seed: u32) -> ImgVec<RGBAPLU> {
+        let mut s = seed | 1;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            (s >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let buf: Vec<RGBAPLU> = (0..w * h)
+            .map(|_| {
+                let a = next();
+                RGBAPLU::new(next() * a, next() * a, next() * a, a)
+            })
+            .collect();
+        ImgVec::new(buf, w, h)
+    }
+
+    fn bench_create_pair(b: &mut Bencher, w: usize, h: usize) {
+        let attr = Dssim::new();
+        let a = img(w, h, 0x1234_5678);
+        let c = img(w, h, 0x9E37_79B9);
+        b.iter(|| {
+            test::black_box(attr.create_image(test::black_box(&a)));
+            test::black_box(attr.create_image(test::black_box(&c)));
+        });
+    }
+
+    fn bench_compare_pair(b: &mut Bencher, w: usize, h: usize) {
+        let attr = Dssim::new();
+        let a = img(w, h, 0x1234_5678);
+        let c = img(w, h, 0x9E37_79B9);
+        b.iter(|| {
+            let orig = attr.create_image(test::black_box(&a)).unwrap();
+            let modif = attr.create_image(test::black_box(&c)).unwrap();
+            test::black_box(attr.compare(&orig, &modif))
+        });
+    }
+
+    #[bench] fn create_pair_1024x768(b: &mut Bencher) { bench_create_pair(b, 1024, 768); }
+    #[bench] fn create_pair_1920x1080(b: &mut Bencher) { bench_create_pair(b, 1920, 1080); }
+
+    #[bench] fn compare_pair_1024x768(b: &mut Bencher) { bench_compare_pair(b, 1024, 768); }
+    #[bench] fn compare_pair_1920x1080(b: &mut Bencher) { bench_compare_pair(b, 1920, 1080); }
+}
