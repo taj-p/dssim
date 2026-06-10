@@ -17,6 +17,15 @@
  * If not, see <http://www.gnu.org/licenses/agpl.txt>.
  */
 #![allow(clippy::manual_range_contains)]
+
+// DSSIM allocates many large, short-lived image buffers per comparison. A
+// caching allocator avoids the default allocator's mmap/munmap + page-fault
+// churn on those (~8MB at 1080p) buffers. Off only if the `mimalloc` feature
+// is disabled.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use getopts::Options;
 #[cfg(feature = "threads")]
 use rayon::prelude::*;

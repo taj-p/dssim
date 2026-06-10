@@ -150,6 +150,7 @@ dependencies = [
  "imgref",
  "load_image",
  "lodepng",
+ "mimalloc",
  "ordered-channel",
  "rayon",
  "rgb",
